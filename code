@@ -1,0 +1,1688 @@
+
+import os, numpy as np
+import random
+import matplotlib.pyplot as plt
+import math
+import copy
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from collections import deque
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("cuda available:", torch.cuda.is_available())
+print("cuda device count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("cuda device name:", torch.cuda.get_device_name(0))
+    print("current device:", torch.cuda.current_device())
+print("Using device:", device)
+
+SEEDS = [0, 10, 20, 30, 40]
+
+all_ssr_histories = []   # shape: [num_seeds, episodes]
+all_diff_histories = []  # shape: [num_seeds, episodes]
+
+
+
+# ======================
+# 参数设置（对齐 CMAB-RB）
+# ======================
+num_RSU = 4
+num_UAV = 1
+num_agents = num_RSU + num_UAV
+
+# 对齐 CMAB-RB：车辆数 60
+num_vehicle = 60
+
+num_beams_per_rsu = 3
+
+# 对齐 CMAB-RB：UAV 4 个“虚拟槽位”= 最多服务 4 车 = 4 个 RB
+num_beams_per_uav = 4
+
+# 以 RB 为单位
+num_rb = 8  # RB0..RB7
+
+# 每个 RSU 对应固定 RB pair（同 RSU 的 3 个 beam 共用该 pair）
+rsu_rb_map = {
+    0: [0, 1],
+    1: [2, 3],
+    2: [4, 5],
+    3: [6, 7],
+}
+
+# UAV 每次最多用 4 个 RB
+uav_max_rb = 4
+
+num_RB= 8
+
+def get_num_beams(agent_id):
+    return num_beams_per_rsu if agent_id < num_RSU else num_beams_per_uav
+
+# 训练参数
+episodes = 600
+steps_per_episode = 100
+
+# 通信参数
+bandwidth = 10e6  # 10MHz
+
+# RSU: 3 beams × 2 veh/beam => 6 links
+RSU_MAX_LINKS = num_beams_per_rsu * 2  # = 6
+
+
+# ==============
+# Contextual MAB: Multi-Play LinUCB (for RB selection)
+# ==============
+class MultiPlayLinUCB:
+    def __init__(self, num_arms, dim, alpha=1.0, K=4):
+        self.num_arms = num_arms  # RB 数 = 8
+        self.alpha = alpha
+        self.K = K                # 每次选几个RB = 4
+        self.A = [np.identity(dim) for _ in range(num_arms)]
+        self.b = [np.zeros((dim, 1)) for _ in range(num_arms)]
+
+    def update(self, arms, X_list, reward):
+        r = float(reward)
+        for arm in arms:
+            x = X_list[arm].reshape(-1, 1)
+            self.A[arm] += x @ x.T
+            self.b[arm] += r * x
+
+    def choose_arms(self, X_list):
+        score_rows = []
+        for arm in range(self.num_arms):
+            x = X_list[arm].reshape(-1, 1)
+            A_inv = np.linalg.inv(self.A[arm])
+            theta = A_inv @ self.b[arm]
+            mean = (theta.T @ x).item()
+            bonus = self.alpha * np.sqrt((x.T @ A_inv @ x).item())
+            ucb = mean + bonus
+            score_rows.append((ucb, arm))
+
+        score_rows.sort(key=lambda t: t[0], reverse=True)
+        arms = [arm for (_, arm) in score_rows[:self.K]]
+        return arms
+
+# ======================
+# CMAB-power（RB 版）
+# ======================
+class BeamMACOLPowerAgent:
+    def __init__(self, parent_id, beam_idx, power_levels, is_rsu=True):
+        self.parent_id = parent_id
+        self.beam_idx = beam_idx
+        self.power_levels = power_levels
+        self.is_rsu = is_rsu
+
+        self.eps = 1.0
+        self.eps_min = 0.01
+        self.eps_decay = 0.9997  # 可和 DQN 相同
+
+        self.q_value = {}
+        self.q_count = {}
+        self.last_keys = []
+        self.prev_choice = None
+
+    def _q_get(self, key):
+        return self.q_value.get(key, 0.0)
+
+    def _q_update(self, key, reward, alpha=0.1):
+        v = self.q_value.get(key, 0.0)
+        self.q_value[key] = (1 - alpha) * v + alpha * float(reward)
+        self.q_count[key] = self.q_count.get(key, 0) + 1
+
+    def build_context(self, env, context_actions, veh_id):
+        """
+        Beam/RB 版上下文（升级为 beam-level overlap 判定）：
+        - me_rb：上一拍我这条链路用的 RB
+        - interferer_cnt：满足【几何可干扰 + beam overlap + 同 RB 发射】的邻居数量
+        - max_nb_pidx：这些邻居在 me_rb 上的上一拍最大功率档位（per-RB view）
+        """
+        me_rb = -1
+        if 0 <= self.parent_id < num_agents and 0 <= veh_id < num_vehicle:
+            me_rb = int(env.rb_allocation[self.parent_id, int(veh_id)])
+
+        interferer_cnt = 0
+        max_nb_pidx = 0
+
+        # 我这条 RSU-link 属于哪个 beam（0..2）
+        # 你这里 self.beam_idx 实际是 link_k(0..5)
+        my_beam_idx = None
+        if self.is_rsu:
+            my_beam_idx = int(self.beam_idx) // int(env.max_vehicle_per_beam)  # 0,1,2
+
+        for other in range(num_agents):
+            # 同一个 parent（同 RSU / 同 UAV）不互扰
+            if other == self.parent_id:
+                continue
+
+            # ==========
+            # (1) 几何可干扰判定 + beam overlap（仅 RSU-RSU 用）
+            # ==========
+            could = False
+
+            if other < num_RSU:
+                # other 是 RSU：必须满足
+                #   - 存在某个 other_beam，使得：
+                #       (a) other_beam 覆盖 veh_id
+                #       (b) other_beam 与 my_beam overlap
+                #       (c) other_beam 在 me_rb 上确实在发射（same-RB-active）
+                if (me_rb < 0) or (my_beam_idx is None):
+                    # 如果我这条链路没有 RB 或我不是 RSU-link，就无法做 beam级判断
+                    could = False
+                else:
+                    active = env.rsu_beam_vehicle_map.get(other, {})
+                    for ob, veh_list in active.items():
+                        ob = int(ob)
+
+                        # (a) beam overlap（几何版：你已有 _beams_overlap_idx(rsu_a,beam_a,rsu_b,beam_b)）
+                        if not env._beams_overlap_idx(self.parent_id, my_beam_idx, other, ob, allow_adjacent=False):
+                            continue
+
+                        # (b) other 的该 beam 必须覆盖到我的 veh_id
+                        if not env._vehicle_in_rsu_beam(other, ob, int(veh_id)):
+                            continue
+
+                        # (c) other 的该 beam 必须真的在 me_rb 上发射（同RB才算 co-RB interferer）
+                        if not env._rsu_beam_uses_rb(other, ob, int(me_rb)):
+                            continue
+
+                        could = True
+                        break
+
+            else:
+                # other 是 UAV：仍用 coverage 判定 + same-RB 判定（UAV无beam扇区）
+                other_uav_local = other - num_RSU
+                if env._vehicle_in_uav_coverage(other_uav_local, int(veh_id)):
+                    # UAV 必须在 me_rb 上对某个 served vehicle 发射，才算同RB干扰
+                    if me_rb >= 0:
+                        other_served = np.where(env.associations[other] > 0)[0]
+                        for sv in other_served:
+                            rb_other = int(env.rb_allocation[other, int(sv)])
+                            if rb_other == int(me_rb):
+                                could = True
+                                break
+
+            if not could:
+                continue
+
+            # ==========
+            # (2) 计数 + 取同RB最大功率档位（per-RB view）
+            # ==========
+            interferer_cnt += 1
+
+            # context_actions[other]['power'] 是你做的 per-RB view（长度 num_rb）
+            if ('power' in context_actions[other]) and context_actions[other]['power']:
+                if 0 <= me_rb < num_rb:
+                    pidx_same_rb = int(context_actions[other]['power'][int(me_rb)])
+                    max_nb_pidx = max(max_nb_pidx, pidx_same_rb)
+
+        # ==========
+        # (3) 离散 token
+        # ==========
+        N_token = f"N{min(interferer_cnt, 3)}"
+        M_token = f"M{min(max_nb_pidx, 4)}"
+
+        # RB token（0-7 分组：0-1,2-3,4-5,6-7）
+        if me_rb < 0:
+            R_token = "RX"
+        else:
+            if me_rb <= 1:
+                R_token = "R0"
+            elif me_rb <= 3:
+                R_token = "R1"
+            elif me_rb <= 5:
+                R_token = "R2"
+            else:
+                R_token = "R3"
+
+        return f"[{R_token},{N_token},{M_token}]"
+
+    def select_power(self, sim_step, env, context_actions, veh_id):
+        self.last_keys = []
+
+        # ===== epsilon-greedy: exponential decay  =====
+        eps = self.eps
+
+        ctx = self.build_context(env, context_actions, veh_id)
+        K = len(self.power_levels)
+
+        if random.random() < eps:
+            a = random.randint(0, K - 1)
+        else:
+            best_val, best_set = -1e9, []
+            for pi in range(K):
+                q = self._q_get((ctx, pi))
+                if q > best_val + 1e-12:
+                    best_val, best_set = q, [pi]
+                elif abs(q - best_val) <= 1e-12:
+                    best_set.append(pi)
+            a = random.choice(best_set) if best_set else random.randint(0, K - 1)
+
+        self.prev_choice = a
+        self.last_keys.append((ctx, a))
+        return a
+
+    def learn_from_reward(self, reward):
+        if not self.last_keys:
+            return
+        r = float(reward)
+        for key in self.last_keys:
+            self._q_update(key, r, alpha=0.1)
+        self.last_keys = []
+
+# ===========================
+# Dueling Double DQN Agent
+# ===========================
+class DQNAgent:
+    def __init__(self, state_dim, action_dim, agent_id):
+        self.agent_id = agent_id
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.tau = 0.01
+        LR = 1e-3; GAMMA = 0.99; BUFFER_SIZE = 20000; BATCH_SIZE = 64
+
+        class DuelingNetwork(nn.Module):
+            def __init__(self, s_dim, a_dim):
+                super().__init__()
+                self.feature = nn.Sequential(nn.Linear(s_dim, 64), nn.ReLU())
+                self.value_stream = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, 1))
+                self.adv_stream   = nn.Sequential(nn.Linear(64, 32), nn.ReLU(), nn.Linear(32, a_dim))
+            def forward(self, x):
+                x = self.feature(x)
+                v = self.value_stream(x)
+                a = self.adv_stream(x)
+                return v + a - a.mean(dim=1, keepdim=True)
+
+        self.q = DuelingNetwork(state_dim, action_dim).to(device)
+        self.t = DuelingNetwork(state_dim, action_dim).to(device)
+        self.t.load_state_dict(self.q.state_dict())
+        self.opt = optim.Adam(self.q.parameters(), lr=LR)
+
+        self.mem = deque(maxlen=BUFFER_SIZE)
+        self.gamma = GAMMA
+        self.batch = BATCH_SIZE
+        self.eps, self.eps_min, self.eps_decay = 1.0, 0.01, 0.9997
+
+    def act(self, state, training=True):
+        if training and (np.random.rand() < self.eps):
+            return np.random.randint(self.action_dim)
+        s = torch.FloatTensor(state).unsqueeze(0).to(device)
+        with torch.no_grad():
+            q = self.q(s)
+        return int(torch.argmax(q).item())
+
+    def remember(self, s, a, r, s2, done):
+        self.mem.append((s, a, r, s2, done))
+
+    def replay(self):
+        if len(self.mem) < self.batch: return
+        import random
+        batch = random.sample(self.mem, self.batch)
+        s, a, r, s2, d = zip(*batch)
+
+        s_arr = np.asarray(s, dtype=np.float32)
+        s2_arr = np.asarray(s2, dtype=np.float32)
+        a_arr = np.asarray(a, dtype=np.int64)
+        r_arr = np.asarray(r, dtype=np.float32)
+        d_arr = np.asarray(d, dtype=np.float32)
+
+        s = torch.from_numpy(s_arr).to(device)
+        s2 = torch.from_numpy(s2_arr).to(device)
+        a = torch.from_numpy(a_arr).unsqueeze(1).to(device)
+        r = torch.from_numpy(r_arr).unsqueeze(1).to(device)
+        d = torch.from_numpy(d_arr).unsqueeze(1).to(device)
+
+        q_sa = self.q(s).gather(1, a) #当前Q（s，a）
+
+        #计算TD target
+        with torch.no_grad():
+            a2 = self.q(s2).argmax(1, keepdim=True)
+            q_s2a2 = self.t(s2).gather(1, a2)
+            target = r + (1 - d) * self.gamma * q_s2a2
+
+        loss = nn.SmoothL1Loss()(q_sa, target)
+        self.opt.zero_grad(); loss.backward(); self.opt.step()
+
+        # soft update
+        for tp, p in zip(self.t.parameters(), self.q.parameters()):
+            tp.data.copy_(self.tau * p.data + (1 - self.tau) * tp.data)
+
+# ======================
+# V2X环境（精确奖励计算）
+# ======================
+class V2XEnvironment:
+    def __init__(self):
+        self.delta_t = 1.0  # seconds per step
+        self.rsu_total_power = 30.0  # 每个RSU总功率(W)
+        self.uav_total_power = 30.0  # 每个UAV总功率(W)
+
+        # 道路布局（3GPP TR 36.885高速公路案例）
+        road_length = 500  # 500m道路
+        lane_width = 20  # 标准车道宽度
+
+        # 初始化车辆位置和速度
+        self.vehicle_pos = np.zeros((num_vehicle, 2))
+        self.vehicle_speeds = np.full(num_vehicle, 15.0)  # 所有车辆速度 15 m/s
+
+        # 泊松分布的 x 坐标（保留泊松分布）
+        mean_gap = road_length / num_vehicle
+        gaps = np.random.exponential(scale=mean_gap, size=num_vehicle - 1)
+        gaps *= road_length / np.sum(gaps)
+        x_positions = np.cumsum(np.insert(gaps, 0, 0))
+
+        # 定义每个 RSU 的 3 个 beam 的中心角（单位：角度）
+        self.rsu_beams = {
+            0: [90, 150, 30],  # RSU-0 (200, 0) 面朝上（Y 正方向）
+            1: [90, 150, 30],  # RSU-1 (400, 0)
+            2: [270, 210, 330],  # RSU-2 (100, 80) 面朝下（Y 负方向）
+            3: [270, 210, 330]  # RSU-3 (300, 80)
+        }
+        self.rsu_beam_range = 60  # 半径为 60 米
+        self.rsu_beam_angle = 60  # 每个 beam 为 60°
+        self.uav_coverage = 45.0  # UAV 圆形覆盖半径 = 45
+        self.max_vehicle_per_beam = 2  # 每个 beam 最多2个车
+        self.uav_speed = 10.0  # UAV 固定速度，每 step 移动 4 米
+
+        # UAV移动方向映射（简化为固定移动向量）
+        directions = {
+            0: 90,  # 北
+            1: 0,  # 东
+            2: 270,  # 南
+            3: 180,  # 西
+            4: 135,  # 东北
+            5: 45,  # 东南
+            6: 225,  # 西南
+            7: 315,  # 西北
+            8: None  # 静止
+        }
+
+        self.trajectory_map = {}
+        for k, angle in directions.items():
+            if angle is None:
+                self.trajectory_map[k] = np.array([0.0, 0.0])
+            else:
+                rad = np.radians(angle)
+                dx = self.uav_speed * np.cos(rad)
+                dy = self.uav_speed * np.sin(rad)
+                self.trajectory_map[k] = np.array([dx, dy])
+
+        # 分配车道 + 设置方向
+        for i in range(num_vehicle):
+            lane = random.randint(0, 3)
+            self.vehicle_pos[i, 0] = x_positions[i]
+            self.vehicle_pos[i, 1] = lane * lane_width + lane_width / 2
+
+            # 速度幅值：每辆车一个常数（km/h）
+            v_kmh = random.uniform(60.0, 100.0)
+            v = v_kmh * (1000.0 / 3600.0)  # -> m/s
+
+            # 方向：上两条车道向左(负)，下两条向右(正)
+            if lane >= 2:
+                self.vehicle_speeds[i] = -v
+            else:
+                self.vehicle_speeds[i] = v
+
+        # 基础设施位置
+        self.rsu_pos = np.array([[200, 0], [400, 0], [100, 80], [300, 80]])  # 4个RSU
+        self.uav_pos = np.array([[250, 40]], dtype=np.float32)  # UAV初始位置
+        self.uav_prev_pos = self.uav_pos.copy()
+
+        # ===== Shadowing: 先创建阴影“状态”矩阵(单位:dB) =====
+        self.shadow_sigma_dB = 8.0  # 阴影标准差(dB)
+        self.shadowing_state = np.random.normal(
+            0.0, self.shadow_sigma_dB, size=(num_agents, num_vehicle)
+        ).astype(np.float32)
+        # ===== Shadowing correlation distance (meters) =====
+        # 用于 rho = exp(-Δd / dcorr)，dcorr 越大阴影变化越慢
+        # 高速公路场景可先用 50m 作为稳健默认值；后续你可以做 25/50/100m 的敏感性分析
+        self.dcorr_v2i = 50.0
+
+        # 初始化信道（首次：previous_state=None）
+        self.channel_state = self._init_channel_state()
+        self.associations = np.zeros((num_agents, num_vehicle))
+        self.update_associations()
+        # 车辆到智能体的映射
+        self.vehicle_agent_map = np.argmax(self.associations, axis=0)
+
+        self.rb_allocation = -np.ones((num_agents, num_vehicle), dtype=int)
+
+        # ===== RB级功率：每个 agent 对每个 RB 一个功率（W）=====
+        # P[agent, rb]，在 step() 内根据 actions[agent]['power'][rb] 填充
+        self.rb_power = np.zeros((num_agents, num_rb), dtype=np.float32)
+
+    def _init_channel_state(self, previous_state=None):
+        """
+        生成/演进总损耗(dB)矩阵：
+        L_total(dB) = 路径损耗(dB) + 阴影(dB) - 快衰落增益(dB)
+        previous_state 为 None 表示首帧（用已采样的 shadowing_state）；
+        非 None 表示本帧（按 AR-1 更新阴影）。
+        """
+        channel = np.zeros((num_agents, num_vehicle), dtype=np.float32)
+
+        for i in range(num_agents):
+            # 发射端位置与高度
+            if i < num_RSU:
+                tx_pos = self.rsu_pos[i, :2]
+                h_tx = 5.0  # 典型RSU高度（米）
+            else:
+                uav_idx = i - num_RSU
+                tx_pos = self.uav_pos[uav_idx]
+                h_tx = float(30.0)  # 或用全局 uav_height
+
+            for j in range(num_vehicle):
+                rx_pos = self.vehicle_pos[j]
+                h_rx = 1.5  # 车辆天线高度（米）
+
+                # ---- 路径损耗(3D距离) ----
+                d_3d = np.sqrt(np.sum((tx_pos - rx_pos) ** 2) + (h_tx - h_rx) ** 2)
+                d_km = max(d_3d / 1000.0, 0.035)  # 下限避免 log(0)
+                path_loss_db = 128.1 + 37.6 * np.log10(d_km)
+
+                # ---- 阴影(距离相关的 AR-1) ----
+                if previous_state is None:
+                    shadow_db = self.shadowing_state[i, j]
+                else:
+                    # 计算链路相对位移 Δd（m）
+                    if i < num_RSU:
+                        tx_prev = self.rsu_pos[i, :2]
+                        tx_curr = self.rsu_pos[i, :2]
+                        dcorr = self.dcorr_v2i
+                    else:
+                        uav_idx = i - num_RSU
+                        tx_prev = self.uav_prev_pos[uav_idx]
+                        tx_curr = self.uav_pos[uav_idx]
+                        dcorr = self.dcorr_v2i  # UAV->Veh 你可声明为“V2I-like extension”
+
+                    rx_prev = self.vehicle_prev_pos[j]
+                    rx_curr = self.vehicle_pos[j]
+
+                    if i < num_RSU:
+                        delta_d = np.linalg.norm(rx_curr - rx_prev)
+                    else:
+                        delta_d = np.linalg.norm(rx_curr - rx_prev) + np.linalg.norm(tx_curr - tx_prev)
+
+                    rho = float(np.exp(-delta_d / max(1e-6, dcorr)))
+
+                    eps = np.random.normal(0.0, self.shadow_sigma_dB)
+                    new_shadow = rho * self.shadowing_state[i, j] + np.sqrt(max(0.0, 1.0 - rho ** 2)) * eps
+                    self.shadowing_state[i, j] = new_shadow
+                    shadow_db = new_shadow
+
+                # ---- 快衰落：Rayleigh |h|^2 → dB增益 ----
+                fast_pow = np.random.rayleigh(1.0) ** 2
+                fast_gain_db = 10.0 * np.log10(fast_pow)
+
+                # ---- 合成总损耗(dB) ----
+                channel[i, j] = path_loss_db + shadow_db - fast_gain_db
+
+        return channel
+
+    def update_channel_with_correlation(self):
+        # 触发“阴影AR(1)+快衰落重采样+路径损耗重算”
+        self.channel_state = self._init_channel_state(previous_state=self.channel_state)
+
+    def update_associations(self):
+        """关联逻辑"""
+        self.associations.fill(0)
+
+        # RSU beam occupancy: {rsu_id: {beam_idx: vehicle_idx}}
+        self.rsu_beam_vehicle_map = {rsu: {} for rsu in range(num_RSU)}
+
+        for j in range(num_vehicle):
+            vx, vy = self.vehicle_pos[j]
+            associated = False
+
+            # 尝试每个RSU
+            for rsu_id in range(num_RSU):
+                if associated:
+                    break
+
+                rsu_x, rsu_y = self.rsu_pos[rsu_id]
+                dx = vx - rsu_x
+                dy = vy - rsu_y
+                dist = np.hypot(dx, dy)
+
+                if dist > self.rsu_beam_range:
+                    continue
+
+                # 计算相对角度
+                angle = (np.degrees(np.arctan2(dy, dx)) + 360) % 360
+
+                for beam_idx, center_angle in enumerate(self.rsu_beams[rsu_id]):
+                    delta = abs((angle - center_angle + 180) % 360 - 180)
+                    if delta <= self.rsu_beam_angle / 2:
+                        # 检查该beam是否已被占用
+                        beam_dict = self.rsu_beam_vehicle_map[rsu_id]
+                        veh_list = beam_dict.setdefault(beam_idx, [])
+                        if len(veh_list) < 2:
+                            veh_list.append(j)
+                            self.associations[rsu_id, j] = 1
+                            associated = True
+                            break
+
+            # UAV关联（如果RSU关联失败）
+            if not associated:
+                for uav_local_idx in range(num_UAV):
+                    uav_id = num_RSU + uav_local_idx
+                    cap = uav_max_rb  # =4
+                    ux, uy = self.uav_pos[uav_local_idx]
+                    dist_uav = math.hypot(vx - ux, vy - uy)
+                    if dist_uav <= self.uav_coverage and np.sum(self.associations[uav_id, :]) < cap:
+                        self.associations[uav_id, j] = 1
+                        associated = True
+                        break
+
+        # 更新车辆到智能体的映射
+        self.vehicle_agent_map = np.argmax(self.associations, axis=0)
+
+    def calculate_sinr(self, agent_id, vehicle_idx, actions, tx_power_W_list):
+        """按 RB 计算 V2I 下行链路的 SINR，干扰只来自同 RB 的发射端（beam-level overlap 版）"""
+
+        # 信道功率增益
+        h_dB = self.channel_state[agent_id, int(vehicle_idx)]
+        h = 10 ** (-h_dB / 10)
+
+        # 当前链路的发射功率
+        tx_power = float(self.power_allocation[agent_id, int(vehicle_idx)])
+        if tx_power <= 0:
+            return 0.0
+
+        signal = tx_power * h
+
+        # 热噪声
+        noise_floor = 10 ** ((-174 + 10 * math.log10(bandwidth) - 30) / 10)
+
+        # 当前链路使用的 RB
+        rb_me = int(self.rb_allocation[agent_id, int(vehicle_idx)])
+        if rb_me < 0:
+            return 0.0
+
+        # 我这条链路所属的 serving beam（仅 RSU 有意义）
+        my_beam = None
+        if agent_id < num_RSU:
+            my_beam = self._get_serving_beam(agent_id, int(vehicle_idx))  # 0..2 或 None
+
+        interference = 0.0
+
+        for other_agent in range(num_agents):
+            if other_agent == agent_id:
+                continue
+
+            # ---------- RSU 干扰方 ----------
+            if other_agent < num_RSU:
+                active_beams = self.rsu_beam_vehicle_map.get(other_agent, {})
+                if not active_beams:
+                    continue
+
+                for beam_idx, veh_list in active_beams.items():
+                    beam_idx = int(beam_idx)
+
+                    # (1) beam overlap：只有 overlap 的 beam 才可能互扰
+                    if my_beam is not None:
+                        if not self._beams_overlap_idx(agent_id, int(my_beam), other_agent, beam_idx,
+                                                       allow_adjacent=False):
+                            continue
+
+                    # (2) 对方 beam 必须覆盖到我的 vehicle（方向性干扰）
+                    if not self._vehicle_in_rsu_beam(other_agent, beam_idx, int(vehicle_idx)):
+                        continue
+
+                    # (3) 对方该 beam 必须真的在 rb_me 上发射（否则不算 co-RB 干扰）
+                    if not self._rsu_beam_uses_rb(other_agent, beam_idx, rb_me):
+                        continue
+
+                    # (4) same-RB 干扰功率累加
+                    for sv in veh_list:
+                        sv = int(sv)
+                        rb_other = int(self.rb_allocation[other_agent, sv])
+                        if rb_other != rb_me:
+                            continue
+
+                        P_j_u = float(self.power_allocation[other_agent, sv])
+                        if P_j_u <= 0:
+                            continue
+
+                        h_int_dB = self.channel_state[other_agent, int(vehicle_idx)]
+                        h_int = 10 ** (-h_int_dB / 10)
+                        interference += P_j_u * h_int
+
+            # ---------- UAV 干扰方 ----------
+            else:
+                other_uav_local = other_agent - num_RSU
+
+                # UAV 不覆盖该 vehicle，则不产生干扰
+                if not self._vehicle_in_uav_coverage(other_uav_local, int(vehicle_idx)):
+                    continue
+
+                # UAV served vehicles
+                served_vs = np.where(self.associations[other_agent] > 0)[0]
+                for sv in served_vs:
+                    sv = int(sv)
+                    rb_other = int(self.rb_allocation[other_agent, sv])
+                    if rb_other != rb_me:
+                        continue
+
+                    P_j_u = float(self.power_allocation[other_agent, sv])
+                    if P_j_u <= 0:
+                        continue
+
+                    h_int_dB = self.channel_state[other_agent, int(vehicle_idx)]
+                    h_int = 10 ** (-h_int_dB / 10)
+                    interference += P_j_u * h_int
+
+        return float(signal / (interference + noise_floor))
+
+    def step(self, actions):
+        """环境步进 - UAV采用完全固定策略，MFMARL专注功率控制"""
+        self.uav_prev_pos = self.uav_pos.copy()
+        self.vehicle_prev_pos = self.vehicle_pos.copy()  # 给阴影相关用（如果你用了距离相关rho）
+
+        # 车辆移动（m/s × s = m）
+        for j in range(num_vehicle):
+            self.vehicle_pos[j, 0] += self.vehicle_speeds[j] * self.delta_t
+            if self.vehicle_pos[j, 0] > 500:
+                self.vehicle_pos[j, 0] = 0
+            elif self.vehicle_pos[j, 0] < 0:
+                self.vehicle_pos[j, 0] = 500
+
+        # === UAV 按轨迹动作移动 ===
+        for uav_local in range(num_UAV):
+            uav_id = num_RSU + uav_local
+            # 动作里传的是 0..8 的离散方向索引
+            dir_idx = int(actions[uav_id].get('trajectory', 8))
+            move_vec = self.trajectory_map.get(dir_idx, np.array([0.0, 0.0]))
+            self.uav_pos[uav_local] = self.uav_pos[uav_local] + move_vec
+            # 边界裁剪
+            self.uav_pos[uav_local, 0] = np.clip(self.uav_pos[uav_local, 0], 0, 500)
+            self.uav_pos[uav_local, 1] = np.clip(self.uav_pos[uav_local, 1], 0, 80)
+
+        # 更新关联 & 信道
+        self.update_associations()
+        self.update_channel_with_correlation()
+
+        # ===== 3. 清空上一时刻的 RB 分配 =====
+        self.rb_allocation.fill(-1)
+
+        # ===== 4. RSU 为各条车链路分配 RB =====
+        # 同一个 RSU 的 3 个 beam 共用同一对 RB pair（例如 RSU0→RB0,1）
+        for rsu_id in range(num_RSU):
+            rb_pair = rsu_rb_map[rsu_id]
+            rb0, rb1 = rb_pair[0], rb_pair[1]
+
+            beam_dict = self.rsu_beam_vehicle_map.get(rsu_id, {})
+            for beam_idx, veh_list in beam_dict.items():
+                for local_slot, veh_id in enumerate(veh_list):
+                    if local_slot == 0:
+                        rb = rb0
+                    elif local_slot == 1:
+                        rb = rb1
+                    else:
+                        break
+                    self.rb_allocation[rsu_id, veh_id] = rb
+
+        # ===== 5. UAV 为其关联车辆分配 RB（多RB版本） =====
+        for uav_local in range(num_UAV):
+            uav_id = num_RSU + uav_local
+
+            rb_list = actions[uav_id].get('rb', [])
+            rb_list = list(rb_list)[:uav_max_rb]
+
+            served_vs = np.where(self.associations[uav_id] > 0)[0]
+            served_vs = served_vs[:len(rb_list)]
+
+            for slot, veh_id in enumerate(served_vs):
+                rb = rb_list[slot]
+                self.rb_allocation[uav_id, veh_id] = rb
+
+        # ===== RB级功率分配：每个 agent 对每个 RB 一个功率 =====
+        self.power_allocation = np.zeros((num_agents, num_vehicle), dtype=np.float32)
+        self.rb_power.fill(0.0)
+
+        # 记录每个 UAV 在总功率约束下的缩放系数 scale（用于 p1=1-scale）
+        uav_scale = np.ones(num_UAV, dtype=np.float32)
+
+        for agent_id in range(num_agents):
+            served_vs = np.where(self.associations[agent_id] > 0)[0]
+            if len(served_vs) == 0:
+                continue
+
+            # =========================
+            # (A) RSU: per-link power（最多6条链路）
+            # =========================
+            if agent_id < num_RSU:
+                p_link_idx = actions[agent_id].get('power', [0] * RSU_MAX_LINKS)
+
+                link_demands = []
+                link_veh_ids = []
+
+                beam_dict = self.rsu_beam_vehicle_map.get(agent_id, {})
+                for beam_idx, veh_list in beam_dict.items():
+                    for slot_idx, veh_id in enumerate(veh_list):
+                        if slot_idx >= self.max_vehicle_per_beam:
+                            break
+                        link_k = beam_idx * self.max_vehicle_per_beam + slot_idx  # 0..5
+                        if link_k >= len(p_link_idx):
+                            continue
+
+                        p_idx = int(p_link_idx[link_k])
+                        p_idx = max(0, min(p_idx, len(RSU_POWER_LEVELS) - 1))
+                        p_watt = float(RSU_POWER_LEVELS[p_idx])
+
+                        link_demands.append(p_watt)
+                        link_veh_ids.append(int(veh_id))
+
+                if len(link_demands) == 0:
+                    continue
+
+                # RSU 总功率约束（30W）：超预算按比例缩放
+                final_p = self.allocate_rsu_power_with_constraint(
+                    agent_id, link_demands, float(self.rsu_total_power)
+                )
+
+                # 下发到每条链路：每车一功率（同beam不共享，同RB也不共享）
+                for k, veh_id in enumerate(link_veh_ids):
+                    self.power_allocation[agent_id, veh_id] = float(final_p[k])
+
+                continue  # 关键：RSU 完事了，直接进入下一个 agent_id
+
+            # =========================
+            # (B) UAV: keep RB-level power（每RB一个功率）
+            # =========================
+            # 统计该 UAV 本步实际使用到的 RB（只看已服务车辆）
+            used_rbs = []
+            for v in served_vs:
+                rb = int(self.rb_allocation[agent_id, int(v)])
+                if 0 <= rb < num_rb:
+                    used_rbs.append(rb)
+            used_rbs = sorted(set(used_rbs))
+            if len(used_rbs) == 0:
+                continue
+
+            powers_rb = actions[agent_id].get('power', [0] * num_rb)
+
+            demands = []
+            rb_list = []
+            for rb in used_rbs:
+                p_idx = int(powers_rb[rb]) if rb < len(powers_rb) else 0
+                p_idx = max(0, min(p_idx, len(UAV_POWER_LEVELS) - 1))
+                p_watt = float(UAV_POWER_LEVELS[p_idx])
+
+                demands.append(p_watt)
+                rb_list.append(rb)
+
+            total_cap = float(self.uav_total_power)
+
+            # UAV：计算 scale（p1=1-scale）
+            total_demand = float(np.sum(demands)) if len(demands) > 0 else 0.0
+            if total_demand <= 1e-12:
+                scale = 1.0
+            else:
+                scale = min(1.0, total_cap / total_demand)
+            uav_local = int(agent_id - num_RSU)
+            if 0 <= uav_local < num_UAV:
+                uav_scale[uav_local] = float(scale)
+
+            final_p = self.allocate_rsu_power_with_constraint(agent_id, demands, total_cap)
+
+            # 写入 RB级功率表
+            for k, rb in enumerate(rb_list):
+                self.rb_power[agent_id, rb] = float(final_p[k])
+
+            # 下发到 link：每条 link 的功率由它的 RB 决定
+            for v in served_vs:
+                rb = int(self.rb_allocation[agent_id, int(v)])
+                if 0 <= rb < num_rb:
+                    self.power_allocation[agent_id, int(v)] = float(self.rb_power[agent_id, rb])
+
+        # ===== 计算 system sum rate =====
+        rewards = np.zeros(num_agents)
+        total_system_rate = 0.0
+        # 统计 UAV 侧本 step 的速率与用功率，用于 p2（rate per watt）
+        uav_rate = np.zeros(num_UAV, dtype=np.float32)
+        uav_pused = np.zeros(num_UAV, dtype=np.float32)
+
+        for i in range(num_agents):
+            sum_rate_i = 0.0
+            if i < num_RSU:
+                active = self.rsu_beam_vehicle_map.get(i, {})
+                for beam_idx, veh_list in active.items():
+                    for veh in veh_list:
+                        sinr = self.calculate_sinr(i, veh, actions, self.power_allocation)
+                        rate = (1 / num_rb) * math.log2(1.0 + sinr)
+                        sum_rate_i += rate
+
+            else:
+                cap = get_num_beams(i)
+                served_vs = np.where(self.associations[i] > 0)[0][:cap]
+                for k, veh in enumerate(served_vs):
+                    sinr = self.calculate_sinr(i, veh, actions, self.power_allocation)
+                    rate = (1.0 / num_rb) * math.log2(1.0 + max(float(sinr), 1e-12))
+                    sum_rate_i += rate
+                    uav_local = int(i - num_RSU)
+                    if 0 <= uav_local < num_UAV:
+                        uav_rate[uav_local] += float(rate)
+                        uav_pused[uav_local] += float(self.power_allocation[i, veh])
+
+            total_system_rate += sum_rate_i
+
+
+
+        # —— 关键：纯 SSR ——
+        rewards[:] = float(total_system_rate)
+        return rewards, float(total_system_rate)
+
+    def allocate_rsu_power_with_constraint(self, agent_id, power_demands, max_total_power):
+        """为RSU分配功率，确保不超过总功率限制"""
+        total_demand = sum(power_demands)
+        if total_demand <= max_total_power:
+            return power_demands
+        else:
+            # 超限，按比例缩放
+            scale_factor = max_total_power / total_demand
+            return [p * scale_factor for p in power_demands]
+
+    def _vehicle_in_rsu_beam(self, rsu_id: int, beam_idx: int, vehicle_idx: int) -> bool:
+        """车辆是否位于该 RSU 的指定 beam 覆盖内（半径+扇区角）"""
+        range_m = self.rsu_beam_range
+        beam_angle = self.rsu_beam_angle
+        center_angle = self.rsu_beams[rsu_id][beam_idx]
+
+        vx, vy = self.vehicle_pos[vehicle_idx]
+        rsu_x, rsu_y = self.rsu_pos[rsu_id, :2]
+        dx, dy = vx - rsu_x, vy - rsu_y
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist > range_m:
+            return False
+
+        angle = (math.degrees(math.atan2(dy, dx)) + 360) % 360
+        delta = abs((angle - center_angle + 180) % 360 - 180)
+        return (delta <= beam_angle / 2)
+
+    def _vehicle_in_uav_coverage(self, uav_local_idx, vehicle_idx):
+        ux, uy = self.uav_pos[uav_local_idx]
+        vx, vy = self.vehicle_pos[vehicle_idx]
+        dx, dy = vx - ux, vy - uy
+        return (dx * dx + dy * dy) <= (self.uav_coverage ** 2)
+
+    def get_uav_state(self, agent_id: int):
+        """11维：pos(2) + load(1) + dens(8)"""
+        assert agent_id >= num_RSU
+        uav_idx = agent_id - num_RSU
+
+        pos = self.uav_pos[uav_idx]
+        norm_x = float(pos[0]) / 500.0
+        norm_y = float(pos[1]) / 80.0
+
+        load = float(np.sum(self.associations[agent_id]) / uav_max_rb)
+        dens = self._compute_unconnected_direction_density(agent_id)
+
+        return np.array([norm_x, norm_y, load, *dens], dtype=np.float32)
+
+    def _compute_unconnected_direction_density(self, agent_id, eps=1.0, sigma=40.0):
+        """8维：对未被RSU接住的车辆，按方向计权(越近权重越大)，再做max归一化。"""
+        uav_idx = agent_id - num_RSU
+        uav_pos = self.uav_pos[uav_idx]
+        dir_density = np.zeros(8, dtype=np.float32)
+
+        # 标记被RSU接住的车辆
+        vehicle_connected = np.zeros(num_vehicle, dtype=bool)
+        for rsu_id, beam_dict in self.rsu_beam_vehicle_map.items():
+            for _, veh_list in beam_dict.items():
+                for v in veh_list:
+                    vehicle_connected[v] = True
+
+        for v in range(num_vehicle):
+            if vehicle_connected[v]: continue
+            veh = self.vehicle_pos[v]
+            dx, dy = veh[0] - uav_pos[0], veh[1] - uav_pos[1]
+            dist = math.hypot(dx, dy)
+            w = 1.0 / (dist + eps)  # 简洁稳定
+            ang = (np.degrees(np.arctan2(dy, dx)) + 360) % 360
+            sector = int(((ang + 22.5) % 360) // 45)  # 0..7
+            dir_density[sector] += w
+
+        m = dir_density.max()
+        if m > 0: dir_density /= m
+        return dir_density
+
+    def build_ctx_actions_rb_view(self, actions_env):
+        """
+        把“上一拍真实动作 actions_env”转换成一个“per-RB power index 视图”，
+        供 BeamMACOLPowerAgent.build_context() 使用（它默认按 RB 读 power）。
+
+        - RSU（真实是 per-link 6维）：转成 per-RB（8维），每个RB取同RB链路的 max pidx
+        - UAV（真实本来就是 per-RB 8维）：原样返回
+        """
+        ctx = []
+        for agent_id in range(num_agents):
+            entry = {}
+
+            # trajectory / rb 字段保留（build_context不一定用，但保留不会坏）
+            if 'trajectory' in actions_env[agent_id]:
+                entry['trajectory'] = actions_env[agent_id]['trajectory']
+            if 'rb' in actions_env[agent_id]:
+                entry['rb'] = list(actions_env[agent_id]['rb'])
+
+            # 统一提供 per-RB power index: length = num_rb
+            p_rb = [0] * num_rb
+
+            if agent_id < num_RSU:
+                # RSU: actions_env[agent_id]['power'] 是 6 维：[(b0,s0),(b0,s1),(b1,s0),(b1,s1),(b2,s0),(b2,s1)]
+                p_link = actions_env[agent_id].get('power', [0] * RSU_MAX_LINKS)
+
+                beam_dict = self.rsu_beam_vehicle_map.get(agent_id, {})
+                for beam_idx, veh_list in beam_dict.items():
+                    for slot_idx, veh_id in enumerate(veh_list):
+                        if slot_idx >= self.max_vehicle_per_beam:
+                            break
+                        link_k = beam_idx * self.max_vehicle_per_beam + slot_idx  # 0..5
+                        if link_k >= len(p_link):
+                            continue
+
+                        rb = int(self.rb_allocation[agent_id, int(veh_id)])
+                        if 0 <= rb < num_rb:
+                            p_rb[rb] = max(p_rb[rb], int(p_link[link_k]))
+
+            else:
+                # UAV: actions_env[agent_id]['power'] 本来就是 per-RB
+                p_rb_raw = actions_env[agent_id].get('power', [0] * num_rb)
+                for rb in range(num_rb):
+                    p_rb[rb] = int(p_rb_raw[rb]) if rb < len(p_rb_raw) else 0
+
+            entry['power'] = p_rb
+            ctx.append(entry)
+
+        return ctx
+
+    def _angle_in_0_360(self, a):
+        a = float(a) % 360.0
+        return a + 360.0 if a < 0 else a
+
+    def _sector_to_intervals(self, center_deg, half_width_deg):
+        """
+        把一个扇区 [center-half, center+half]（考虑0/360环绕）
+        表示成 1 或 2 个不环绕的区间列表，每个区间都是 [l, r] 且 0<=l<=r<=360
+        """
+        c = self._angle_in_0_360(center_deg)
+        hw = float(half_width_deg)
+
+        l = c - hw
+        r = c + hw
+
+        if l < 0:
+            # [l, r] 跨过 0
+            return [[l + 360.0, 360.0], [0.0, r]]
+        if r >= 360:
+            # [l, r] 跨过 360
+            return [[l, 360.0], [0.0, r - 360.0]]
+        return [[l, r]]
+
+    def _intervals_overlap(self, a, b):
+        """a,b 形如 [l,r]，判断是否重叠（含边界）"""
+        return not (a[1] < b[0] or b[1] < a[0])
+
+    def _beams_overlap_idx(self, rsu_a: int, beam_a: int, rsu_b: int, beam_b: int,
+                           allow_adjacent: bool = False) -> bool:
+        """
+        几何版 beam-overlap 判定：
+        - 使用全局 beam 中心角 + 扇区宽度（self.rsu_beam_angle）
+        - 再加一个 RSU 距离门控，避免“方向重叠但空间永远不相交”
+        """
+        # ---------- 基本防御 ----------
+        if rsu_a < 0 or rsu_a >= num_RSU or rsu_b < 0 or rsu_b >= num_RSU:
+            return False
+        if beam_a < 0 or beam_a >= len(self.rsu_beams[rsu_a]):
+            return False
+        if beam_b < 0 or beam_b >= len(self.rsu_beams[rsu_b]):
+            return False
+
+        # ---------- 距离门控（可调） ----------
+        pa = self.rsu_pos[rsu_a, :2]
+        pb = self.rsu_pos[rsu_b, :2]
+        dist = float(np.linalg.norm(pa - pb))
+
+        # 默认用 2*beam_range 作为“可能相交”的宽松门槛
+        # 如果你希望更严格，可改为 1.5*beam_range 或 1.0*beam_range
+        if dist > 2.0 * float(self.rsu_beam_range):
+            return False
+
+        # ---------- 角度扇区重叠 ----------
+        half = float(self.rsu_beam_angle) / 2.0
+        ca = float(self.rsu_beams[rsu_a][beam_a])
+        cb = float(self.rsu_beams[rsu_b][beam_b])
+
+        # allow_adjacent=True 时，你可以扩大半角，模拟旁瓣/散射导致的“近邻也可能互扰”
+        if allow_adjacent:
+            half = half * 1.2  # 经验放大，可按需调 1.1~1.5
+
+        ia_list = self._sector_to_intervals(ca, half)
+        ib_list = self._sector_to_intervals(cb, half)
+
+        for ia in ia_list:
+            for ib in ib_list:
+                if self._intervals_overlap(ia, ib):
+                    return True
+
+        return False
+
+    def _get_serving_beam(self, rsu_id: int, veh_id: int):
+        """
+        返回：该 veh_id 当前被 rsu_id 的哪个 beam 服务（0..2），找不到返回 None。
+        依赖 self.rsu_beam_vehicle_map（你在 update_associations() 里维护的）。
+        """
+        beam_dict = self.rsu_beam_vehicle_map.get(rsu_id, {})
+        for b, vlist in beam_dict.items():
+            for v in vlist:
+                if int(v) == int(veh_id):
+                    return int(b)
+        return None
+
+    def _rsu_beam_uses_rb(self, rsu_id: int, beam_idx: int, rb: int) -> bool:
+        """
+        判断：某个 RSU 的某个 beam 在本 step 是否“真的使用了 rb”
+        （即该 beam 下至少一个 served vehicle 的 RB == rb）
+        """
+        beam_dict = self.rsu_beam_vehicle_map.get(rsu_id, {})
+        veh_list = beam_dict.get(int(beam_idx), [])
+        for vid in veh_list:
+            rr = int(self.rb_allocation[rsu_id, int(vid)])
+            if rr == int(rb):
+                return True
+        return False
+
+
+# ======================
+# 主训练循环（每个 beam = 一个 agent）
+# ======================
+for SEED in SEEDS:
+    print(f"\n===== Running seed {SEED} =====")
+
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    # === 每个 seed 都重新创建环境和 agent ===
+    env = V2XEnvironment()
+
+    # ===== DQN agents =====
+    NUM_TRAJ_ACTIONS = 9
+    uav_dqn_agents = []
+    uav_states = []
+    for uav_local in range(num_UAV):
+        agent_id = num_RSU + uav_local
+        s0 = env.get_uav_state(agent_id)
+        uav_states.append(s0)
+        uav_dqn_agents.append(
+            DQNAgent(state_dim=len(s0), action_dim=NUM_TRAJ_ACTIONS, agent_id=agent_id)
+        )
+
+    # ===== 为每个 UAV 配置 MultiPlayLinUCB bandit，用于每10步一次的 RB 选择 =====
+    uav_bandits = [MultiPlayLinUCB(num_arms=num_rb, dim=6, alpha=0.5, K=uav_max_rb) for _ in range(num_UAV)]
+    uav_current_rb = [list(range(uav_max_rb)) for _ in range(num_UAV)]
+    uav_ctx_at_select = [None for _ in range(num_UAV)]
+    uav_reward_acc10 = [0.0 for _ in range(num_UAV)]
+    uav_diff_acc10 = [0.0 for _ in range(num_UAV)]
+
+
+    RSU_POWER_LEVELS = [0.0, 7.5, 15.0, 22.5, 30.0]
+    UAV_POWER_LEVELS = [0.0, 7.5, 15.0, 22.5, 30.0]
+
+    rsu_link_controllers = {}
+    uav_rb_controllers = {}
+
+    # RSU: 6 links per RSU
+    for rsu_id in range(num_RSU):
+        for link_k in range(RSU_MAX_LINKS):  # 0..5
+            rsu_link_controllers[(rsu_id, link_k)] = BeamMACOLPowerAgent(
+                parent_id=rsu_id,
+                beam_idx=link_k,
+                power_levels=RSU_POWER_LEVELS,
+                is_rsu=True
+            )
+
+    # UAV: keep per-RB controllers
+    for uav_local in range(num_UAV):
+        uav_id = num_RSU + uav_local
+        for rb in range(num_rb):
+            uav_rb_controllers[(uav_id, rb)] = BeamMACOLPowerAgent(
+                parent_id=uav_id,
+                beam_idx=rb,
+                power_levels=UAV_POWER_LEVELS,
+                is_rsu=False
+            )
+
+    # ===== 每个 seed 自己的 history =====
+    system_sumrate_history = []
+    uav_diff_history = []
+
+
+    for episode in range(episodes):
+        # —— 准备“上一拍动作”容器（全 0），供上下文使用 ——
+        last_actions = []
+        # 也把 uav_states 刷新为当前状态
+        uav_states = [env.get_uav_state(num_RSU + i) for i in range(num_UAV)]
+
+        for i in range(num_agents):
+            if i < num_RSU:
+                entry = {'power': [0] * RSU_MAX_LINKS}  # RSU: 6 links
+            else:
+                entry = {'power': [0] * num_rb}  # UAV: per-RB
+            if i >= num_RSU:
+                uav_local = i - num_RSU
+                entry['trajectory'] = 8
+                entry['rb'] = list(uav_current_rb[uav_local])  # 关键：记录RB
+            last_actions.append(entry)
+
+        # 关键：给控制器用的“上一拍上下文视图”（per-RB）
+        last_actions_ctx = env.build_ctx_actions_rb_view(last_actions)
+
+        ep_rates = []  # 本 episode 的每步系统和速率
+        ep_diff_vals = []  # 记录本集每一步的“多UAV差分均值”
+
+
+        for step in range(steps_per_episode):
+
+            # === 每步：衰减 epsilon（DQN + CMAB-power） ===
+            for uav_local in range(num_UAV):
+                ag = uav_dqn_agents[uav_local]
+                ag.eps = max(ag.eps_min, ag.eps * ag.eps_decay)
+
+            # RSU link controllers
+            for ctrl in rsu_link_controllers.values():
+                ctrl.eps = max(ctrl.eps_min, ctrl.eps * ctrl.eps_decay)
+
+            # UAV RB controllers
+            for ctrl in uav_rb_controllers.values():
+                ctrl.eps = max(ctrl.eps_min, ctrl.eps * ctrl.eps_decay)
+
+            # (A) 每步：先让 DQN 为每个 UAV 选轨迹方向
+            uav_traj_dirs = []
+            for uav_local in range(num_UAV):
+                a_traj = uav_dqn_agents[uav_local].act(uav_states[uav_local], training=True)
+                uav_traj_dirs.append(int(a_traj))
+
+            # (B) 每10步：MultiPlay LinUCB 选择 4 个 RB（中间9步沿用）
+            if step % 10 == 0:
+                for uav_local in range(num_UAV):
+                    uav_id = num_RSU + uav_local
+
+                    assoc_vs = np.where(env.associations[uav_id] > 0)[0]
+                    if len(assoc_vs) > 0:
+                        ref_v = int(assoc_vs[0])
+                    else:
+                        dists = np.linalg.norm(env.vehicle_pos - env.uav_pos[uav_local], axis=1)
+                        ref_v = int(np.argmin(dists))
+
+                    # ① UAV链路增益（与RB无关）
+                    h_uav_dB = env.channel_state[uav_id, ref_v]
+                    uav_link_gain = 10 ** (-h_uav_dB / 10.0)
+
+                    # ② 为每个 RB 构造上下文（根据对应 RSU 干扰）
+                    X_list_rb = []
+
+
+                    for rb in range(num_rb):
+                        rsu_idx_for_rb = None
+                        for r_id, pair in rsu_rb_map.items():
+                            if rb in pair:
+                                rsu_idx_for_rb = r_id
+                                break
+
+                        gains = []
+                        max_neighbor_pidx = 0
+                        if rsu_idx_for_rb is not None:
+                            active = env.rsu_beam_vehicle_map.get(rsu_idx_for_rb, {})
+                            for beam_idx, veh_list in active.items():
+                                if not env._vehicle_in_rsu_beam(rsu_idx_for_rb, beam_idx, ref_v):
+                                    continue
+                                h_int_dB = env.channel_state[rsu_idx_for_rb, ref_v]
+                                gains.append(10 ** (-h_int_dB / 10.0))
+
+                                if 'power' in last_actions[rsu_idx_for_rb] and last_actions[rsu_idx_for_rb]['power']:
+                                    max_neighbor_pidx = max(
+                                        max_neighbor_pidx,
+                                        int(max(last_actions[rsu_idx_for_rb]['power']))
+                                    )
+
+                        avg_int_gain = float(np.mean(gains)) if gains else 0.0
+                        max_neighbor_pidx_norm = max_neighbor_pidx / 4.0
+
+                        # 非线性特征扩展（保持与你原 channel 版一致）
+                        x1 = float(uav_link_gain)
+                        x2 = float(avg_int_gain)
+                        x3 = float(max_neighbor_pidx_norm)
+
+                        # 10D: [x1..x5, x1^2..x5^2]
+                        X_list_rb.append(np.array([
+                            x1, x2, x3,
+                            x1 * x1, x2 * x2, x3 * x3
+                        ], dtype=np.float32))
+
+                    # ③ LinUCB 选 RB（无回传版：只返回 chosen_arms）
+                    chosen_arms = uav_bandits[uav_local].choose_arms(X_list_rb)
+                    uav_current_rb[uav_local] = chosen_arms
+                    uav_ctx_at_select[uav_local] = X_list_rb
+
+            # (C) 组装 actions（每个 agent 恰好一个 entry）
+            actions = []
+            for i in range(num_agents):
+                if i < num_RSU:
+                    entry = {'power': [0] * RSU_MAX_LINKS}  # RSU: 6 links
+                else:
+                    entry = {'power': [0] * num_rb}  # UAV: per-RB
+                if i >= num_RSU:
+                    uav_local = i - num_RSU
+                    # UAV：轨迹 + RB
+                    entry['trajectory'] = int(uav_traj_dirs[uav_local])
+                    entry['rb'] = list(uav_current_rb[uav_local])
+                actions.append(entry)
+
+            sim_step = episode * steps_per_episode + step
+
+            used_rsu_ctrls = set()
+            used_uav_ctrls = set()
+
+            # ===== RSU: per-link power (最多6条) =====
+            for rsu_id in range(num_RSU):
+                beam_dict = env.rsu_beam_vehicle_map.get(rsu_id, {})
+                for beam_idx, veh_list in beam_dict.items():
+                    for slot_idx, veh_id in enumerate(veh_list):
+                        if slot_idx >= 2:
+                            break
+                        link_k = beam_idx * 2 + slot_idx  # 0..5
+                        ctrl = rsu_link_controllers[(rsu_id, link_k)]
+                        used_rsu_ctrls.add((rsu_id, link_k))
+
+                        # 注意：这里用 last_actions_ctx（per-RB 视图）
+                        p_idx = ctrl.select_power(sim_step, env, last_actions_ctx, int(veh_id))
+                        actions[rsu_id]['power'][link_k] = int(p_idx)
+
+            # ===== UAV: keep per-RB power (只对本步被使用的RB选) =====
+            for uav_local in range(num_UAV):
+                uav_id = num_RSU + uav_local
+
+                served_vs = np.where(env.associations[uav_id] > 0)[0]
+                if len(served_vs) == 0:
+                    continue
+
+                rb_to_refveh = {}
+                for v in served_vs:
+                    rb = int(env.rb_allocation[uav_id, int(v)])
+                    if 0 <= rb < num_rb and rb not in rb_to_refveh:
+                        rb_to_refveh[rb] = int(v)
+
+                for rb, ref_v in rb_to_refveh.items():
+                    ctrl = uav_rb_controllers[(uav_id, rb)]
+                    used_uav_ctrls.add((uav_id, rb))
+
+                    p_idx = ctrl.select_power(sim_step, env, last_actions_ctx, int(ref_v))
+                    actions[uav_id]['power'][rb] = int(p_idx)
+
+            # 4) 环境步进
+            rewards, system_sumrate = env.step(actions)
+
+
+            # —— 累计本轮10步的系统回报 ——
+            for uav_local in range(num_UAV):
+                uav_reward_acc10[uav_local] += float(system_sumrate)
+
+            # —— 累计“差分奖励”：本步 SSR 与“将该UAV mute的SSR”之差 ——
+            diffs_this_step = []
+
+            for uav_local in range(num_UAV):
+                uav_id = num_RSU + uav_local
+
+                # 备份并静音该 UAV（把它的发射功率整行清零）
+                backup_power = env.power_allocation.copy()
+                env.power_allocation[uav_id, :] = 0.0
+
+                # 计算“静音基线”的系统总速率（保持其它RSU/UAV不变）
+                ssr_baseline = 0.0
+
+                # RSU 部分
+                for rsu_idx in range(num_RSU):
+                    active = env.rsu_beam_vehicle_map.get(rsu_idx, {})
+                    for beam_idx, veh_list in active.items():
+                        for veh in veh_list:
+                            sinr0 = env.calculate_sinr(rsu_idx, veh, actions, env.power_allocation)
+                            ssr_baseline += (1 / num_rb) * math.log2(1.0 + sinr0)
+
+                # 其它 UAV 的部分（跳过被静音的这个 UAV）
+                for i in range(num_RSU, num_agents):
+                    if i == uav_id:
+                        continue
+                    cap_i = get_num_beams(i)
+                    served_vs_i = np.where(env.associations[i] > 0)[0][:cap_i]
+                    for veh in served_vs_i:
+                        sinr0 = env.calculate_sinr(i, int(veh), actions, env.power_allocation)
+                        ssr_baseline += (1 / num_rb) * math.log2(1.0 + sinr0)
+
+                # 恢复功率矩阵
+                env.power_allocation = backup_power
+
+                # 差分：当前（有UAV发射） - 静音基线
+                diff_val = float(system_sumrate) - float(ssr_baseline)
+                uav_diff_acc10[uav_local] += diff_val
+                diffs_this_step.append(diff_val)
+
+
+            # (G) DQN 回填：用本步 diff_val 作为 reward
+            next_states = [env.get_uav_state(num_RSU + i) for i in range(num_UAV)]
+            for uav_local in range(num_UAV):
+                r = float(diffs_this_step[uav_local])  # ★ 差分奖励驱动轨迹学习
+                done_flag = (step == steps_per_episode - 1)
+                uav_dqn_agents[uav_local].remember(
+                    uav_states[uav_local],
+                    uav_traj_dirs[uav_local],
+                    r,
+                    next_states[uav_local],
+                    done_flag
+                )
+
+                # 在每步 DQN 回放之后
+                uav_dqn_agents[uav_local].replay()
+
+            uav_states = next_states
+            # 这一步所有 UAV 的平均边际贡献（仅用于日志可视化）
+            if diffs_this_step:
+                ep_diff_vals.append(float(np.mean(diffs_this_step)))
+
+            # —— 每10步末（step%10==9）用“差分奖励均值”回填LinUCB ——
+            if step % 10 == 9:
+                for uav_local in range(num_UAV):
+                    avg_diff = uav_diff_acc10[uav_local] / 10.0
+                    ctx = uav_ctx_at_select[uav_local]
+                    arms = uav_current_rb[uav_local]
+                    if ctx is not None and arms is not None:
+                        uav_bandits[uav_local].update(arms, ctx, avg_diff)
+
+                    # ★ 必须：macro-step 结束后清零累加器
+                    uav_diff_acc10[uav_local] = 0.0
+                    uav_reward_acc10[uav_local] = 0.0  # 如果你不用它，也可以删掉整个reward_acc10
+
+
+            # 5) 学习回填（纯 SSR）
+            for key in used_rsu_ctrls:
+                rsu_link_controllers[key].learn_from_reward(system_sumrate)
+            for key in used_uav_ctrls:
+                uav_rb_controllers[key].learn_from_reward(system_sumrate)
+
+            # 6) 记录并更新“上一拍动作”
+            ep_rates.append(system_sumrate)
+            last_actions = copy.deepcopy(actions)
+            last_actions_ctx = env.build_ctx_actions_rb_view(last_actions)
+
+        avg_rate = float(np.mean(ep_rates)) if ep_rates else 0.0
+        system_sumrate_history.append(avg_rate)
+        avg_diff = float(np.mean(ep_diff_vals)) if ep_diff_vals else 0.0
+        uav_diff_history.append(avg_diff)
+
+        print(f"Episode {episode:4d}/{episodes} | Avg SumRate: {avg_rate:.4f} | Avg DiffReward: {avg_diff:.4f}")
+
+    all_ssr_histories.append(system_sumrate_history)
+    all_diff_histories.append(uav_diff_history)
+
+
+all_ssr = np.array(all_ssr_histories)  # (5, episodes)
+all_diff = np.array(all_diff_histories)  # (5, episodes)
+
+ssr_mean = all_ssr.mean(axis=0)
+ssr_std = all_ssr.std(axis=0)
+
+diff_mean = all_diff.mean(axis=0)
+diff_std = all_diff.std(axis=0)
+
+
+print("训练完成！")
+
+# =========================
+# 方案A：收敛性能 & 稳定性统计
+# =========================
+
+
+def tail_stats_per_seed(curves, K):
+    """
+    curves: ndarray, shape = (num_seeds, episodes)
+    K: last K episodes
+    """
+    num_seeds = curves.shape[0]
+
+    per_seed_mean = []
+    per_seed_var = []
+    per_seed_std = []
+
+    for s in range(num_seeds):
+        tail = curves[s, -K:]
+        per_seed_mean.append(np.mean(tail))
+        per_seed_var.append(np.var(tail))   # episode-level variance
+        per_seed_std.append(np.std(tail))   # episode-level std
+
+    per_seed_mean = np.array(per_seed_mean)
+    per_seed_var  = np.array(per_seed_var)
+    per_seed_std  = np.array(per_seed_std)
+
+    return {
+        "per_seed_mean": per_seed_mean,
+        "per_seed_var":  per_seed_var,
+        "per_seed_std":  per_seed_std,
+        "mean_of_means": float(np.mean(per_seed_mean)),
+        "mean_of_vars":  float(np.mean(per_seed_var)),
+        "mean_of_stds":  float(np.mean(per_seed_std)),
+        "sum_of_vars":   float(np.sum(per_seed_var)),
+        "sum_of_stds":   float(np.sum(per_seed_std)),
+    }
+
+
+def print_tail_stats(title, curves, K, seeds):
+    """
+    打印 + 返回 stats，方便你在外部继续用 stats 做额外分析
+    """
+    stats = tail_stats_per_seed(curves, K)
+
+    print("\n" + "=" * 60)
+    print(f"{title} (Last {K} Episodes)")
+    print("=" * 60)
+
+    for i, (m, v, s) in enumerate(
+        zip(stats["per_seed_mean"],
+            stats["per_seed_var"],
+            stats["per_seed_std"])
+    ):
+        print(
+            f"Seed {seeds[i]} | "
+            f"Mean = {m:.4f} | "
+            f"Var = {v:.6f} | "
+            f"Std = {s:.4f}"
+        )
+
+    print("-" * 60)
+    print(f"[Across Seeds] Mean of Mean = {stats['mean_of_means']:.4f}")
+    print(f"[Across Seeds] Mean of Var  = {stats['mean_of_vars']:.6f}")
+    print(f"[Across Seeds] Mean of Std  = {stats['mean_of_stds']:.4f}")
+    print(f"[Across Seeds] Sum  of Var  = {stats['sum_of_vars']:.6f}")
+    print(f"[Across Seeds] Sum  of Std  = {stats['sum_of_stds']:.4f}")
+
+    return stats
+
+# =========================
+# 新增：收敛速度指标（e_90 + AUC_200/300）
+# =========================
+import numpy as np
+
+def moving_average(x, W=10):
+    x = np.asarray(x, dtype=np.float64)
+    if W <= 1:
+        return x
+    if len(x) < W:
+        # 长度不足时，直接返回整体均值的常数序列（避免报错）
+        return np.full_like(x, fill_value=float(np.mean(x)) if len(x) > 0 else 0.0, dtype=np.float64)
+    kernel = np.ones(W, dtype=np.float64) / W
+    # 'valid' 会变短；为了保持长度，我们在前面 pad
+    y_valid = np.convolve(x, kernel, mode="valid")
+    pad = np.full(W - 1, y_valid[0], dtype=np.float64)
+    return np.concatenate([pad, y_valid])
+
+def time_to_threshold(curve, K_tail=100, ratio=0.90, W=10, M=10):
+    """
+    e_90: 最早达到 ratio * tail_mean 的 episode index（0-based），并要求连续 M 个点都满足。
+    如果找不到，返回 np.nan
+    """
+    curve = np.asarray(curve, dtype=np.float64)
+    T = len(curve)
+    if T == 0:
+        return np.nan
+
+    K_tail = int(min(max(1, K_tail), T))
+    tail_mean = float(np.mean(curve[-K_tail:]))
+    thr = ratio * tail_mean
+
+    sm = moving_average(curve, W=W)
+
+    # 连续 M 个 episode 都 >= thr 才算“真正进入”
+    for e in range(0, T - M + 1):
+        if np.all(sm[e:e+M] >= thr):
+            return float(e)  # episode index (0-based)
+    return np.nan
+
+def auc_first_N(curve, N=200, W=10):
+    """
+    AUC_N: 前 N 个 episode 的平滑曲线求和
+    """
+    curve = np.asarray(curve, dtype=np.float64)
+    if len(curve) == 0:
+        return 0.0
+    N = int(min(max(1, N), len(curve)))
+    sm = moving_average(curve, W=W)
+    return float(np.sum(sm[:N]))
+
+def speed_stats_per_seed(curves, seeds, K_tail=100, ratio=0.90, W=10, M=10, auc_list=(200, 300), title=""):
+    """
+    curves: (num_seeds, episodes)
+    打印 per-seed + across-seed 的 e_90 和 AUC
+    """
+    curves = np.asarray(curves, dtype=np.float64)
+    num_seeds = curves.shape[0]
+
+    e90s = []
+    aucs = {N: [] for N in auc_list}
+
+    for s in range(num_seeds):
+        e90 = time_to_threshold(curves[s], K_tail=K_tail, ratio=ratio, W=W, M=M)
+        e90s.append(e90)
+        for N in auc_list:
+            aucs[N].append(auc_first_N(curves[s], N=N, W=W))
+
+    e90s = np.asarray(e90s, dtype=np.float64)
+    for N in auc_list:
+        aucs[N] = np.asarray(aucs[N], dtype=np.float64)
+
+    print("\n" + "=" * 60)
+    print(f"{title} | Convergence-Speed Metrics")
+    print("=" * 60)
+    print(f"Definition: e_90 = earliest episode where MA(W={W}) >= 0.90 * mean(last K_tail={K_tail}), sustained M={M}")
+
+    for i in range(num_seeds):
+        # e_90 用 1-based episode 更符合直觉（可选）
+        e90_show = "NA" if np.isnan(e90s[i]) else f"{int(e90s[i]) + 1:d}"
+        msg = f"Seed {seeds[i]} | e_90(ep) = {e90_show}"
+        for N in auc_list:
+            msg += f" | AUC_{N} = {aucs[N][i]:.4f}"
+        print(msg)
+
+    # across-seeds：对 e_90，忽略 NA
+    valid_e90 = e90s[~np.isnan(e90s)]
+    if valid_e90.size > 0:
+        print("-" * 60)
+        print(f"[Across Seeds] e_90 mean = {np.mean(valid_e90) + 1:.2f} ep | std = {np.std(valid_e90):.2f}")
+    else:
+        print("-" * 60)
+        print("[Across Seeds] e_90 mean/std = NA (no seed reached threshold under this criterion)")
+
+    for N in auc_list:
+        print(f"[Across Seeds] AUC_{N} mean = {np.mean(aucs[N]):.4f} | std = {np.std(aucs[N]):.4f}")
+
+    return {"e90": e90s, "auc": aucs}
+
+
+# ===== 在你现有 tail-stats 打印之后，再加这两段（SSR + Diff 各打一遍）=====
+# 你可以先用 K_tail=100（与你已有 last-100 的稳定性统计一致），W=10, M=10
+speed_stats_per_seed(
+    curves=all_ssr,
+    seeds=SEEDS,
+    K_tail=100, ratio=0.90, W=10, M=10,
+    auc_list=(200, 300),
+    title="System Sum-Rate"
+)
+
+speed_stats_per_seed(
+    curves=all_diff,
+    seeds=SEEDS,
+    K_tail=100, ratio=0.90, W=10, M=10,
+    auc_list=(200, 300),
+    title="Diff Reward"
+)
+
+# ===== 对 SSR 和 Diff Reward      做统计 =====
+for K in [50, 100]:
+    ssr_stats = print_tail_stats(
+        title="System Sum-Rate Statistics",
+        curves=all_ssr,
+        K=K,
+        seeds=SEEDS
+    )
+
+    diff_stats = print_tail_stats(
+        title="Diff Reward Statistics",
+        curves=all_diff,
+        K=K,
+        seeds=SEEDS
+    )
+
+    # （可选）你如果想在每个 K 下额外输出一句汇总对比，也可以用返回值来打印
+    print("\n" + "-" * 60)
+    print(f"[Summary Last {K}] SSR Mean={ssr_stats['mean_of_means']:.4f}, Std={ssr_stats['mean_of_stds']:.4f} | "
+          f"Diff Mean={diff_stats['mean_of_means']:.4f}, Std={diff_stats['mean_of_stds']:.4f}")
+
+
+
+
+# 第一张图：系统总速率
+plt.figure(figsize=(8, 4))
+plt.plot(ssr_mean, label="fb0 Avg SSR (5 seeds)")
+plt.fill_between(
+    range(len(ssr_mean)),
+    ssr_mean - ssr_std,
+    ssr_mean + ssr_std,
+    alpha=0.2
+)
+plt.title("System Sum-Rate (5-seed average)")
+plt.xlabel("Episode")
+plt.ylabel("SSR (bits/s/Hz)")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+# 第二张图：UAV 差分奖励
+plt.figure(figsize=(8, 4))
+plt.plot(diff_mean, label="fb0 Avg DiffReward (5 seeds)", color="orange")
+plt.fill_between(
+    range(len(diff_mean)),
+    diff_mean - diff_std,
+    diff_mean + diff_std,
+    alpha=0.2,
+    color="orange"
+)
+plt.title("UAV Difference Reward (5-seed average)")
+plt.xlabel("Episode")
+plt.ylabel("DiffReward (bits/s/Hz)")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+SAVE_DIR = os.path.dirname(__file__)  # 保存到脚本所在目录
+np.savez(os.path.join(SAVE_DIR, "results_fb0.npz"),
+         all_ssr=all_ssr, all_diff=all_diff,
+         ssr_mean=ssr_mean, ssr_std=ssr_std,
+         diff_mean=diff_mean, diff_std=diff_std)
+print("[SAVED] results_fb0.npz")
